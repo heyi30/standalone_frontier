@@ -122,7 +122,7 @@ FrontierResult StandaloneFrontierMap::update(
           const auto [truncation_x, truncation_y] = lidarPointToWorld(range_max, angle, odom);
           PixelRC truncation;
           if (worldToPixel(truncation_x, truncation_y, &truncation)) {
-            markExploredPastObstacle(endpoint, truncation);
+            markUnknownPastObstacle(endpoint, truncation);
           }
         }
         if (finite && raw_range <= range_max) {
@@ -253,7 +253,7 @@ void StandaloneFrontierMap::traceFreeRay(const PixelRC & start, const PixelRC & 
   }
 }
 
-void StandaloneFrontierMap::markExploredPastObstacle(
+void StandaloneFrontierMap::markUnknownPastObstacle(
   const PixelRC & obstacle,
   const PixelRC & truncation)
 {
@@ -288,7 +288,7 @@ void StandaloneFrontierMap::markExploredPastObstacle(
     if ((dr * dr + dc * dc) <= obstacle_radius_sq) {
       continue;
     }
-    setCell(pixels[i].row, pixels[i].col, kGridCellFree);
+    setCell(pixels[i].row, pixels[i].col, kGridCellUnknown);
   }
 
   if (!found_outer_obstacle) {
