@@ -104,10 +104,19 @@ private:
   int index(int row, int col) const;
   std::uint8_t cellAt(int row, int col) const;
   void setCell(int row, int col, std::uint8_t value);
-  void markDisk(int row, int col, double radius_m, std::uint8_t value);
-  std::vector<PixelRC> linePixels(const PixelRC & start, const PixelRC & end) const;
-  void traceFreeRay(const PixelRC & start, const PixelRC & end);
-  void markUnknownToTruncationIfNoObstacle(const PixelRC & obstacle, const PixelRC & truncation);
+  void setMaskDisk(
+    std::vector<std::uint8_t> & mask,
+    int row,
+    int col,
+    double radius_m,
+    std::uint8_t value) const;
+  std::vector<std::uint8_t> dilatedObstacleMask() const;
+  std::vector<std::uint8_t> reachableMask(
+    const PixelRC & start,
+    const std::vector<std::uint8_t> & obstacle_mask) const;
+  std::vector<std::uint8_t> erodeMask(
+    const std::vector<std::uint8_t> & mask,
+    int radius_px) const;
   std::pair<double, double> lidarPointToWorld(
     double range_m,
     double angle_rad,
@@ -120,6 +129,7 @@ private:
 
   FrontierConfig config_;
   std::vector<std::uint8_t> cells_;
+  std::vector<std::uint8_t> obstacle_cells_;
 };
 
 std::string resultToJson(const FrontierResult & result);

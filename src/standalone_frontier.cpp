@@ -57,7 +57,8 @@ void appendJsonBool(std::ostringstream & out, bool value)
 
 StandaloneFrontierMap::StandaloneFrontierMap(FrontierConfig config)
 : config_(config),
-  cells_(static_cast<std::size_t>(config.width * config.height), kGridCellUnknown)
+  cells_(static_cast<std::size_t>(config.width * config.height), kGridCellUnknown),
+  obstacle_cells_(static_cast<std::size_t>(config.width * config.height), 0U)
 {
   if (config_.width <= 0 || config_.height <= 0) {
     throw std::runtime_error("width and height must be positive");
@@ -78,6 +79,7 @@ StandaloneFrontierMap::StandaloneFrontierMap(FrontierConfig config)
 void StandaloneFrontierMap::reset()
 {
   std::fill(cells_.begin(), cells_.end(), kGridCellUnknown);
+  std::fill(obstacle_cells_.begin(), obstacle_cells_.end(), 0U);
 }
 
 FrontierResult StandaloneFrontierMap::update(
@@ -102,32 +104,16 @@ FrontierResult StandaloneFrontierMap::update(
 
   PixelRC agent;
   const bool agent_in_bounds = worldToPixel(odom.x, odom.y, &agent);
-  if (agent_in_bounds) {
-    markDisk(agent.row, agent.col, config_.robot_radius_m, kGridCellFree);
-  }
 
   double angle = angle_min;
   for (std::size_t i = 0; i < range_count; ++i) {
     const double raw_range = ranges[i];
     const bool finite = std::isfinite(raw_range);
-    double range = finite ? raw_range : range_max;
-    range = std::min(range, range_max);
-
-    if (range >= range_min && agent_in_bounds) {
-      const auto [world_x, world_y] = lidarPointToWorld(range, angle, odom);
+    if (finite && raw_range >= range_min && raw_range < range_max) {
+      const auto [world_x, world_y] = lidarPointToWorld(raw_range, angle, odom);
       PixelRC endpoint;
       if (worldToPixel(world_x, world_y, &endpoint)) {
-        traceFreeRay(agent, endpoint);
-        if (finite && raw_range < range_max) {
-          const auto [truncation_x, truncation_y] = lidarPointToWorld(range_max, angle, odom);
-          PixelRC truncation;
-          if (worldToPixel(truncation_x, truncation_y, &truncation)) {
-            markUnknownToTruncationIfNoObstacle(endpoint, truncation);
-          }
-        }
-        if (finite && raw_range <= range_max) {
-          markDisk(endpoint.row, endpoint.col, config_.obstacle_radius_m, kGridCellOccupied);
-        }
+        obstacle_cells_[static_cast<std::size_t>(index(endpoint.row, endpoint.col))] = 1U;
       }
     }
 
@@ -135,7 +121,17 @@ FrontierResult StandaloneFrontierMap::update(
   }
 
   if (agent_in_bounds) {
-    markDisk(agent.row, agent.col, config_.robot_radius_m, kGridCellFree);
+    std::vector<std::uint8_t> obstacle_mask = dilatedObstacleMask();
+    setMaskDisk(obstacle_mask, agent.row, agent.col, config_.robot_radius_m, 0U);
+    const std::vector<std::uint8_t> reachable = reachableMask(agent, obstacle_mask);
+    const std::vector<std::uint8_t> eroded_reachable = erodeMask(reachable, 1);
+
+    std::fill(cells_.begin(), cells_.end(), kGridCellOccupied);
+    for (std::size_t i = 0; i < eroded_reachable.size(); ++i) {
+      if (eroded_reachable[i] != 0U) {
+        cells_[i] = kGridCellFree;
+      }
+    }
   }
   return detectFrontiers(odom);
 }
@@ -200,95 +196,118 @@ void StandaloneFrontierMap::setCell(int row, int col, std::uint8_t value)
   }
 }
 
-void StandaloneFrontierMap::markDisk(int row, int col, double radius_m, std::uint8_t value)
+void StandaloneFrontierMap::setMaskDisk(
+  std::vector<std::uint8_t> & mask,
+  int row,
+  int col,
+  double radius_m,
+  std::uint8_t value) const
 {
-  const int radius_px = std::max(1, static_cast<int>(std::ceil(radius_m / config_.meters_per_pixel)));
+  const int radius_px = std::max(0, static_cast<int>(std::ceil(radius_m / config_.meters_per_pixel)));
   for (int dr = -radius_px; dr <= radius_px; ++dr) {
     for (int dc = -radius_px; dc <= radius_px; ++dc) {
       if ((dr * dr + dc * dc) <= radius_px * radius_px) {
-        setCell(row + dr, col + dc, value);
+        const int mask_row = row + dr;
+        const int mask_col = col + dc;
+        if (inBounds(mask_row, mask_col)) {
+          mask[static_cast<std::size_t>(index(mask_row, mask_col))] = value;
+        }
       }
     }
   }
 }
 
-std::vector<PixelRC> StandaloneFrontierMap::linePixels(
+std::vector<std::uint8_t> StandaloneFrontierMap::dilatedObstacleMask() const
+{
+  std::vector<std::uint8_t> mask(obstacle_cells_.size(), 0U);
+  for (int row = 0; row < config_.height; ++row) {
+    for (int col = 0; col < config_.width; ++col) {
+      if (obstacle_cells_[static_cast<std::size_t>(index(row, col))] != 0U) {
+        setMaskDisk(mask, row, col, config_.obstacle_radius_m, 1U);
+      }
+    }
+  }
+  return mask;
+}
+
+std::vector<std::uint8_t> StandaloneFrontierMap::reachableMask(
   const PixelRC & start,
-  const PixelRC & end) const
+  const std::vector<std::uint8_t> & obstacle_mask) const
 {
-  std::vector<PixelRC> pixels;
-  int row = start.row;
-  int col = start.col;
-  const int dcol = std::abs(end.col - start.col);
-  const int drow = -std::abs(end.row - start.row);
-  const int step_col = start.col < end.col ? 1 : -1;
-  const int step_row = start.row < end.row ? 1 : -1;
-  int error = dcol + drow;
+  std::vector<std::uint8_t> reachable(obstacle_mask.size(), 0U);
+  const auto start_index = static_cast<std::size_t>(index(start.row, start.col));
+  if (obstacle_mask[start_index] != 0U) {
+    return reachable;
+  }
 
-  while (true) {
-    if (!inBounds(row, col)) {
-      break;
-    }
-    pixels.push_back(PixelRC{row, col});
-    if (row == end.row && col == end.col) {
-      break;
-    }
-    const int e2 = 2 * error;
-    if (e2 >= drow) {
-      error += drow;
-      col += step_col;
-    }
-    if (e2 <= dcol) {
-      error += dcol;
-      row += step_row;
+  std::queue<PixelRC> pending;
+  pending.push(start);
+  reachable[start_index] = 1U;
+
+  while (!pending.empty()) {
+    const PixelRC current = pending.front();
+    pending.pop();
+
+    for (const auto & direction : kCardinalDirections) {
+      const int neighbor_row = current.row + direction.row;
+      const int neighbor_col = current.col + direction.col;
+      if (!inBounds(neighbor_row, neighbor_col)) {
+        continue;
+      }
+
+      const auto neighbor_index = static_cast<std::size_t>(index(neighbor_row, neighbor_col));
+      if (reachable[neighbor_index] != 0U || obstacle_mask[neighbor_index] != 0U) {
+        continue;
+      }
+      reachable[neighbor_index] = 1U;
+      pending.push(PixelRC{neighbor_row, neighbor_col});
     }
   }
-  return pixels;
+
+  return reachable;
 }
 
-void StandaloneFrontierMap::traceFreeRay(const PixelRC & start, const PixelRC & end)
+std::vector<std::uint8_t> StandaloneFrontierMap::erodeMask(
+  const std::vector<std::uint8_t> & mask,
+  int radius_px) const
 {
-  for (const PixelRC & pixel : linePixels(start, end)) {
-    setCell(pixel.row, pixel.col, kGridCellFree);
-  }
-}
-
-void StandaloneFrontierMap::markUnknownToTruncationIfNoObstacle(
-  const PixelRC & obstacle,
-  const PixelRC & truncation)
-{
-  const std::vector<PixelRC> pixels = linePixels(obstacle, truncation);
-  if (pixels.size() <= 2U) {
-    return;
+  if (radius_px <= 0) {
+    return mask;
   }
 
-  const int obstacle_radius_px = std::max(
-    1,
-    static_cast<int>(std::ceil(config_.obstacle_radius_m / config_.meters_per_pixel)));
-  const int obstacle_radius_sq = obstacle_radius_px * obstacle_radius_px;
-  const std::size_t truncation_index = pixels.size() - 1U;
+  std::vector<std::uint8_t> eroded(mask.size(), 0U);
+  const int radius_sq = radius_px * radius_px;
+  for (int row = 0; row < config_.height; ++row) {
+    for (int col = 0; col < config_.width; ++col) {
+      const auto cell_index = static_cast<std::size_t>(index(row, col));
+      if (mask[cell_index] == 0U) {
+        continue;
+      }
 
-  for (std::size_t i = 1U; i < truncation_index; ++i) {
-    const int dr = pixels[i].row - obstacle.row;
-    const int dc = pixels[i].col - obstacle.col;
-    if ((dr * dr + dc * dc) <= obstacle_radius_sq) {
-      continue;
+      bool keep = true;
+      for (int dr = -radius_px; keep && dr <= radius_px; ++dr) {
+        for (int dc = -radius_px; dc <= radius_px; ++dc) {
+          if ((dr * dr + dc * dc) > radius_sq) {
+            continue;
+          }
+          const int neighbor_row = row + dr;
+          const int neighbor_col = col + dc;
+          if (!inBounds(neighbor_row, neighbor_col) ||
+            mask[static_cast<std::size_t>(index(neighbor_row, neighbor_col))] == 0U)
+          {
+            keep = false;
+            break;
+          }
+        }
+      }
+      if (!keep) {
+        continue;
+      }
+      eroded[cell_index] = 1U;
     }
-    if (cellAt(pixels[i].row, pixels[i].col) == kGridCellOccupied) {
-      return;
-    }
   }
 
-  for (std::size_t i = 1U; i < truncation_index; ++i) {
-    const int dr = pixels[i].row - obstacle.row;
-    const int dc = pixels[i].col - obstacle.col;
-    if ((dr * dr + dc * dc) <= obstacle_radius_sq) {
-      continue;
-    }
-    setCell(pixels[i].row, pixels[i].col, kGridCellUnknown);
-  }
-
-  setCell(pixels[truncation_index].row, pixels[truncation_index].col, kGridCellOccupied);
+  return eroded;
 }
 
 std::pair<double, double> StandaloneFrontierMap::lidarPointToWorld(
