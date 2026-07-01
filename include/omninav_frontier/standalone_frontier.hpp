@@ -105,7 +105,9 @@ private:
   std::uint8_t cellAt(int row, int col) const;
   void setCell(int row, int col, std::uint8_t value);
   void markDisk(int row, int col, double radius_m, std::uint8_t value);
+  std::vector<PixelRC> linePixels(const PixelRC & start, const PixelRC & end) const;
   void traceFreeRay(const PixelRC & start, const PixelRC & end);
+  void markExploredPastObstacle(const PixelRC & obstacle, const PixelRC & truncation);
   std::pair<double, double> lidarPointToWorld(
     double range_m,
     double angle_rad,
