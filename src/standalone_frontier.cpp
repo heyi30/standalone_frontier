@@ -122,7 +122,7 @@ FrontierResult StandaloneFrontierMap::update(
           const auto [truncation_x, truncation_y] = lidarPointToWorld(range_max, angle, odom);
           PixelRC truncation;
           if (worldToPixel(truncation_x, truncation_y, &truncation)) {
-            markUnknownPastObstacle(endpoint, truncation);
+            markUnknownToTruncationIfNoObstacle(endpoint, truncation);
           }
         }
         if (finite && raw_range <= range_max) {
@@ -253,7 +253,7 @@ void StandaloneFrontierMap::traceFreeRay(const PixelRC & start, const PixelRC & 
   }
 }
 
-void StandaloneFrontierMap::markUnknownPastObstacle(
+void StandaloneFrontierMap::markUnknownToTruncationIfNoObstacle(
   const PixelRC & obstacle,
   const PixelRC & truncation)
 {
@@ -266,23 +266,20 @@ void StandaloneFrontierMap::markUnknownPastObstacle(
     1,
     static_cast<int>(std::ceil(config_.obstacle_radius_m / config_.meters_per_pixel)));
   const int obstacle_radius_sq = obstacle_radius_px * obstacle_radius_px;
-  std::size_t boundary_index = pixels.size() - 1U;
-  bool found_outer_obstacle = false;
+  const std::size_t truncation_index = pixels.size() - 1U;
 
-  for (std::size_t i = 1U; i < pixels.size(); ++i) {
+  for (std::size_t i = 1U; i < truncation_index; ++i) {
     const int dr = pixels[i].row - obstacle.row;
     const int dc = pixels[i].col - obstacle.col;
     if ((dr * dr + dc * dc) <= obstacle_radius_sq) {
       continue;
     }
     if (cellAt(pixels[i].row, pixels[i].col) == kGridCellOccupied) {
-      boundary_index = i;
-      found_outer_obstacle = true;
-      break;
+      return;
     }
   }
 
-  for (std::size_t i = 1U; i < boundary_index; ++i) {
+  for (std::size_t i = 1U; i < truncation_index; ++i) {
     const int dr = pixels[i].row - obstacle.row;
     const int dc = pixels[i].col - obstacle.col;
     if ((dr * dr + dc * dc) <= obstacle_radius_sq) {
@@ -291,9 +288,7 @@ void StandaloneFrontierMap::markUnknownPastObstacle(
     setCell(pixels[i].row, pixels[i].col, kGridCellUnknown);
   }
 
-  if (!found_outer_obstacle) {
-    setCell(pixels[boundary_index].row, pixels[boundary_index].col, kGridCellOccupied);
-  }
+  setCell(pixels[truncation_index].row, pixels[truncation_index].col, kGridCellOccupied);
 }
 
 std::pair<double, double> StandaloneFrontierMap::lidarPointToWorld(

@@ -107,7 +107,7 @@ private:
   void markDisk(int row, int col, double radius_m, std::uint8_t value);
   std::vector<PixelRC> linePixels(const PixelRC & start, const PixelRC & end) const;
   void traceFreeRay(const PixelRC & start, const PixelRC & end);
-  void markUnknownPastObstacle(const PixelRC & obstacle, const PixelRC & truncation);
+  void markUnknownToTruncationIfNoObstacle(const PixelRC & obstacle, const PixelRC & truncation);
   std::pair<double, double> lidarPointToWorld(
     double range_m,
     double angle_rad,
