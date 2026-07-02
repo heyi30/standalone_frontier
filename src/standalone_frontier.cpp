@@ -714,29 +714,56 @@ FrontierResult StandaloneFrontierMap::detectFrontiers(const Odom & odom) const
   }
 
   if (result.frontiers.empty()) {
-    const double yaw_c = std::cos(result.agent_yaw);
-    const double yaw_s = std::sin(result.agent_yaw);
-    const int max_steps = std::max(config_.width, config_.height) * 3;
-    const auto add_edge_frontier = [&](double local_right, double local_forward) {
-        double row = static_cast<double>(result.agent_pixel.row) + 0.5;
-        double col = static_cast<double>(result.agent_pixel.col) + 0.5;
-        const double dcol = yaw_c * local_right + yaw_s * local_forward;
-        const double drow = yaw_s * local_right - yaw_c * local_forward;
-        PixelRC last_free{-1, -1};
+    const auto near_existing = [&](const FrontierPointRC & point) {
+        return std::any_of(
+          result.frontiers.begin(),
+          result.frontiers.end(),
+          [&](const FrontierSegment & existing) {
+            const double row_delta_m =
+              (point.row - existing.midpoint.row) * config_.meters_per_pixel;
+            const double col_delta_m =
+              (point.col - existing.midpoint.col) * config_.meters_per_pixel;
+            return row_delta_m * row_delta_m + col_delta_m * col_delta_m <
+              kMinFrontierSeparationM * kMinFrontierSeparationM;
+          });
+      };
+    const auto add_farthest_free_frontier = [&](double direction_right, double direction_forward) {
+        bool found = false;
+        FrontierPointRC best_point;
+        double best_projection_m = 0.0;
+        double best_lateral_m = 0.0;
 
-        for (int step = 0; step < max_steps; ++step) {
-          const int current_row = static_cast<int>(std::floor(row));
-          const int current_col = static_cast<int>(std::floor(col));
-          if (!inBounds(current_row, current_col) ||
-            cells_[static_cast<std::size_t>(index(current_row, current_col))] != kGridCellFree)
-          {
-            break;
+        for (int row = 0; row < config_.height; ++row) {
+          for (int col = 0; col < config_.width; ++col) {
+            if (cells_[static_cast<std::size_t>(index(row, col))] != kGridCellFree) {
+              continue;
+            }
+
+            const FrontierPointRC point{
+              static_cast<double>(row) + 0.5,
+              static_cast<double>(col) + 0.5};
+            const auto [right_m, forward_m] = frontierPointToLocalXz(result, point);
+            const double projection_m =
+              right_m * direction_right + forward_m * direction_forward;
+            if (projection_m <= 0.0) {
+              continue;
+            }
+            const double lateral_m =
+              std::abs(right_m * direction_forward - forward_m * direction_right);
+            const bool better = !found ||
+              projection_m > best_projection_m + 1e-9 ||
+              (std::abs(projection_m - best_projection_m) <= 1e-9 &&
+              lateral_m < best_lateral_m);
+            if (better) {
+              found = true;
+              best_point = point;
+              best_projection_m = projection_m;
+              best_lateral_m = lateral_m;
+            }
           }
-          last_free = PixelRC{current_row, current_col};
-          row += drow * 0.5;
-          col += dcol * 0.5;
         }
-        if (last_free.row < 0) {
+
+        if (!found || near_existing(best_point)) {
           return;
         }
 
@@ -744,19 +771,17 @@ FrontierResult StandaloneFrontierMap::detectFrontiers(const Odom & odom) const
         segment.id = next_id++;
         segment.cell_count = 1;
         segment.boundary_edge_count = 1U;
-        segment.midpoint = {
-          static_cast<double>(last_free.row) + 0.5,
-          static_cast<double>(last_free.col) + 0.5};
+        segment.midpoint = best_point;
         const auto [right_m, forward_m] = frontierPointToLocalXz(result, segment.midpoint);
         segment.local_right_m = right_m;
         segment.local_forward_m = forward_m;
         result.frontiers.push_back(segment);
       };
 
-    add_edge_frontier(0.0, 1.0);
-    add_edge_frontier(0.0, -1.0);
-    add_edge_frontier(-1.0, 0.0);
-    add_edge_frontier(1.0, 0.0);
+    add_farthest_free_frontier(0.0, 1.0);
+    add_farthest_free_frontier(0.0, -1.0);
+    add_farthest_free_frontier(-1.0, 0.0);
+    add_farthest_free_frontier(1.0, 0.0);
   }
 
   return result;
