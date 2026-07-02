@@ -23,6 +23,19 @@ class _Config(ctypes.Structure):
         ("min_frontier_distance_m", ctypes.c_double),
         ("max_frontier_distance_m", ctypes.c_double),
         ("min_boundary_length_px", ctypes.c_size_t),
+        ("log_odds_hit", ctypes.c_double),
+        ("log_odds_miss", ctypes.c_double),
+        ("log_odds_min", ctypes.c_double),
+        ("log_odds_max", ctypes.c_double),
+        ("occupied_log_odds_threshold", ctypes.c_double),
+        ("free_log_odds_threshold", ctypes.c_double),
+        ("endpoint_inflation_radius_m", ctypes.c_double),
+        ("ray_endpoint_clearance_m", ctypes.c_double),
+        ("median_filter_radius", ctypes.c_int),
+        ("outlier_jump_m", ctypes.c_double),
+        ("morph_close_radius_m", ctypes.c_double),
+        ("morph_open_radius_m", ctypes.c_double),
+        ("reachable_erosion_radius_m", ctypes.c_double),
     ]
 
 
@@ -40,6 +53,7 @@ class FrontierResult:
     grid_map: np.ndarray
     frontiers: list[dict]
     metadata: dict
+    layers: dict[str, np.ndarray]
 
 
 def _candidate_library_paths() -> list[Path]:
@@ -101,6 +115,17 @@ def _configure_symbols(lib: ctypes.CDLL) -> None:
     ]
     lib.omninav_frontier_update.restype = ctypes.c_int
 
+    lib.omninav_frontier_copy_debug_layers.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.omninav_frontier_copy_debug_layers.restype = ctypes.c_int
+
     lib.omninav_frontier_free_string.argtypes = [ctypes.c_char_p]
     lib.omninav_frontier_free_string.restype = None
 
@@ -122,6 +147,19 @@ class FrontierMap:
         min_frontier_distance_m: float = 0.5,
         max_frontier_distance_m: float = 20.0,
         min_boundary_length_px: int = 20,
+        log_odds_hit: float = 0.85,
+        log_odds_miss: float = -0.20,
+        log_odds_min: float = -4.0,
+        log_odds_max: float = 4.0,
+        occupied_log_odds_threshold: float = 1.20,
+        free_log_odds_threshold: float = -0.35,
+        endpoint_inflation_radius_m: float = 0.25,
+        ray_endpoint_clearance_m: float = 0.10,
+        median_filter_radius: int = 1,
+        outlier_jump_m: float = 0.75,
+        morph_close_radius_m: float = 0.10,
+        morph_open_radius_m: float = 0.10,
+        reachable_erosion_radius_m: float = 0.0,
         lib_path: Optional[str | os.PathLike[str]] = None,
     ) -> None:
         self._lib = _load_library(lib_path)
@@ -140,6 +178,19 @@ class FrontierMap:
         config.min_frontier_distance_m = float(min_frontier_distance_m)
         config.max_frontier_distance_m = float(max_frontier_distance_m)
         config.min_boundary_length_px = int(min_boundary_length_px)
+        config.log_odds_hit = float(log_odds_hit)
+        config.log_odds_miss = float(log_odds_miss)
+        config.log_odds_min = float(log_odds_min)
+        config.log_odds_max = float(log_odds_max)
+        config.occupied_log_odds_threshold = float(occupied_log_odds_threshold)
+        config.free_log_odds_threshold = float(free_log_odds_threshold)
+        config.endpoint_inflation_radius_m = float(endpoint_inflation_radius_m)
+        config.ray_endpoint_clearance_m = float(ray_endpoint_clearance_m)
+        config.median_filter_radius = int(median_filter_radius)
+        config.outlier_jump_m = float(outlier_jump_m)
+        config.morph_close_radius_m = float(morph_close_radius_m)
+        config.morph_open_radius_m = float(morph_open_radius_m)
+        config.reachable_erosion_radius_m = float(reachable_erosion_radius_m)
 
         handle = self._lib.omninav_frontier_create(ctypes.byref(config))
         if not handle:
@@ -220,10 +271,30 @@ class FrontierMap:
         finally:
             self._lib.omninav_frontier_free_string(result_json)
 
+        raw_hits = np.empty_like(grid)
+        occupied = np.empty_like(grid)
+        reachable_free = np.empty_like(grid)
+        status = self._lib.omninav_frontier_copy_debug_layers(
+            self._handle,
+            raw_hits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            occupied.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            reachable_free.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            grid.size,
+            error,
+            len(error),
+        )
+        if status != 0:
+            raise RuntimeError(error.value.decode("utf-8", errors="replace"))
+
         return FrontierResult(
             grid_map=grid,
             frontiers=metadata.get("frontiers", []),
             metadata=metadata,
+            layers={
+                "raw_hits": raw_hits,
+                "occupied": occupied,
+                "reachable_free": reachable_free,
+            },
         )
 
 

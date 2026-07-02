@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -32,6 +33,14 @@ constexpr std::array<StandaloneFrontierMap::Direction, 8> kComponentDirections{{
   {1, 1},
 }};
 
+std::size_t checkedCellCount(const FrontierConfig & config)
+{
+  if (config.width <= 0 || config.height <= 0) {
+    throw std::runtime_error("width and height must be positive");
+  }
+  return static_cast<std::size_t>(config.width) * static_cast<std::size_t>(config.height);
+}
+
 double normalizeAngle(double angle_rad)
 {
   while (angle_rad > kPi) {
@@ -48,6 +57,31 @@ double odomYawToMapYaw(double odom_yaw_rad)
   return normalizeAngle((kPi * 0.5) - odom_yaw_rad);
 }
 
+bool isFiniteHit(double range_m, double range_min, double range_max)
+{
+  return std::isfinite(range_m) && range_m >= range_min && range_m < range_max;
+}
+
+bool isNoHit(double range_m, double range_max)
+{
+  if (std::isinf(range_m) && range_m > 0.0) {
+    return true;
+  }
+  return std::isfinite(range_m) && range_m >= range_max;
+}
+
+double medianOf(std::vector<double> values)
+{
+  const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2U);
+  std::nth_element(values.begin(), middle, values.end());
+  return *middle;
+}
+
+std::size_t countNonZero(const std::vector<std::uint8_t> & values)
+{
+  return static_cast<std::size_t>(std::count(values.begin(), values.end(), 1U));
+}
+
 void appendJsonBool(std::ostringstream & out, bool value)
 {
   out << (value ? "true" : "false");
@@ -57,29 +91,48 @@ void appendJsonBool(std::ostringstream & out, bool value)
 
 StandaloneFrontierMap::StandaloneFrontierMap(FrontierConfig config)
 : config_(config),
-  cells_(static_cast<std::size_t>(config.width * config.height), kGridCellUnknown),
-  obstacle_cells_(static_cast<std::size_t>(config.width * config.height), 0U)
+  cells_(checkedCellCount(config), kGridCellUnknown),
+  log_odds_(checkedCellCount(config), 0.0),
+  raw_hit_mask_(checkedCellCount(config), 0U),
+  occupied_mask_(checkedCellCount(config), 0U),
+  reachable_free_mask_(checkedCellCount(config), 0U)
 {
-  if (config_.width <= 0 || config_.height <= 0) {
-    throw std::runtime_error("width and height must be positive");
-  }
   if (config_.meters_per_pixel <= 0.0) {
     throw std::runtime_error("meters_per_pixel must be positive");
   }
-  if (config_.robot_radius_m < 0.0 || config_.obstacle_radius_m < 0.0) {
-    throw std::runtime_error("robot_radius_m and obstacle_radius_m must be non-negative");
+  if (config_.robot_radius_m < 0.0 || config_.obstacle_radius_m < 0.0 ||
+    config_.endpoint_inflation_radius_m < 0.0 || config_.ray_endpoint_clearance_m < 0.0 ||
+    config_.morph_close_radius_m < 0.0 || config_.morph_open_radius_m < 0.0 ||
+    config_.reachable_erosion_radius_m < 0.0)
+  {
+    throw std::runtime_error("frontier radii must be non-negative");
   }
   if (config_.min_frontier_distance_m < 0.0 || config_.max_frontier_distance_m < 0.0 ||
     config_.min_frontier_distance_m > config_.max_frontier_distance_m)
   {
     throw std::runtime_error("invalid frontier distance range");
   }
+  if (config_.log_odds_hit <= 0.0 || config_.log_odds_miss >= 0.0) {
+    throw std::runtime_error("log_odds_hit must be positive and log_odds_miss must be negative");
+  }
+  if (config_.log_odds_min >= config_.log_odds_max) {
+    throw std::runtime_error("log_odds_min must be smaller than log_odds_max");
+  }
+  if (config_.free_log_odds_threshold >= config_.occupied_log_odds_threshold) {
+    throw std::runtime_error("free threshold must be smaller than occupied threshold");
+  }
+  if (config_.median_filter_radius < 0 || config_.outlier_jump_m < 0.0) {
+    throw std::runtime_error("range filter parameters must be non-negative");
+  }
 }
 
 void StandaloneFrontierMap::reset()
 {
   std::fill(cells_.begin(), cells_.end(), kGridCellUnknown);
-  std::fill(obstacle_cells_.begin(), obstacle_cells_.end(), 0U);
+  std::fill(log_odds_.begin(), log_odds_.end(), 0.0);
+  std::fill(raw_hit_mask_.begin(), raw_hit_mask_.end(), 0U);
+  std::fill(occupied_mask_.begin(), occupied_mask_.end(), 0U);
+  std::fill(reachable_free_mask_.begin(), reachable_free_mask_.end(), 0U);
 }
 
 FrontierResult StandaloneFrontierMap::update(
@@ -102,37 +155,52 @@ FrontierResult StandaloneFrontierMap::update(
     throw std::runtime_error("range_max must be >= range_min");
   }
 
+  std::fill(raw_hit_mask_.begin(), raw_hit_mask_.end(), 0U);
   PixelRC agent;
-  const bool agent_in_bounds = worldToPixel(odom.x, odom.y, &agent);
+  if (!worldToPixel(odom.x, odom.y, &agent)) {
+    return detectFrontiers(odom);
+  }
+
+  std::vector<std::uint8_t> miss_update_mask(cells_.size(), 0U);
+  std::vector<std::uint8_t> hit_update_mask(cells_.size(), 0U);
+  const std::vector<RangeSample> samples = filterRanges(ranges, range_count, range_min, range_max);
 
   double angle = angle_min;
-  for (std::size_t i = 0; i < range_count; ++i) {
-    const double raw_range = ranges[i];
-    const bool finite = std::isfinite(raw_range);
-    if (finite && raw_range >= range_min && raw_range < range_max) {
-      const auto [world_x, world_y] = lidarPointToWorld(raw_range, angle, odom);
-      PixelRC endpoint;
-      if (worldToPixel(world_x, world_y, &endpoint)) {
-        obstacle_cells_[static_cast<std::size_t>(index(endpoint.row, endpoint.col))] = 1U;
+  for (const RangeSample & sample : samples) {
+    if (sample.valid) {
+      const double clear_range = sample.hit ?
+        std::max(0.0, sample.range - config_.ray_endpoint_clearance_m) :
+        sample.range;
+      markRayFreeCells(miss_update_mask, odom, angle, clear_range);
+
+      if (sample.hit) {
+        const auto [world_x, world_y] = lidarPointToWorld(sample.range, angle, odom);
+        PixelRC endpoint;
+        if (worldToPixel(world_x, world_y, &endpoint)) {
+          const auto endpoint_index = static_cast<std::size_t>(index(endpoint.row, endpoint.col));
+          raw_hit_mask_[endpoint_index] = 1U;
+          setMaskDisk(
+            hit_update_mask,
+            endpoint.row,
+            endpoint.col,
+            config_.endpoint_inflation_radius_m,
+            1U);
+        }
       }
     }
-
     angle += angle_increment;
   }
 
-  if (agent_in_bounds) {
-    std::vector<std::uint8_t> obstacle_mask = dilatedObstacleMask();
-    setMaskDisk(obstacle_mask, agent.row, agent.col, config_.robot_radius_m, 0U);
-    const std::vector<std::uint8_t> reachable = reachableMask(agent, obstacle_mask);
-    const std::vector<std::uint8_t> eroded_reachable = erodeMask(reachable, 1);
-
-    std::fill(cells_.begin(), cells_.end(), kGridCellOccupied);
-    for (std::size_t i = 0; i < eroded_reachable.size(); ++i) {
-      if (eroded_reachable[i] != 0U) {
-        cells_[i] = kGridCellFree;
-      }
+  for (std::size_t i = 0; i < cells_.size(); ++i) {
+    if (hit_update_mask[i] != 0U) {
+      addLogOdds(i, config_.log_odds_hit);
+    } else if (miss_update_mask[i] != 0U) {
+      addLogOdds(i, config_.log_odds_miss);
     }
   }
+
+  addLogOddsDisk(agent.row, agent.col, config_.robot_radius_m, config_.log_odds_miss);
+  rebuildGridFromLogOdds(agent);
   return detectFrontiers(odom);
 }
 
@@ -148,13 +216,24 @@ const std::vector<std::uint8_t> & StandaloneFrontierMap::cells() const
 
 void StandaloneFrontierMap::copyCellsTo(std::uint8_t * output, std::size_t output_count) const
 {
-  if (output == nullptr) {
-    throw std::runtime_error("grid output pointer is null");
-  }
-  if (output_count != cells_.size()) {
-    throw std::runtime_error("grid output size does not match configured map size");
-  }
-  std::memcpy(output, cells_.data(), cells_.size() * sizeof(std::uint8_t));
+  copyMaskTo(cells_, output, output_count);
+}
+
+void StandaloneFrontierMap::copyRawHitMaskTo(std::uint8_t * output, std::size_t output_count) const
+{
+  copyMaskTo(raw_hit_mask_, output, output_count);
+}
+
+void StandaloneFrontierMap::copyOccupiedMaskTo(std::uint8_t * output, std::size_t output_count) const
+{
+  copyMaskTo(occupied_mask_, output, output_count);
+}
+
+void StandaloneFrontierMap::copyReachableFreeMaskTo(
+  std::uint8_t * output,
+  std::size_t output_count) const
+{
+  copyMaskTo(reachable_free_mask_, output, output_count);
 }
 
 bool StandaloneFrontierMap::worldToPixel(double world_x, double world_y, PixelRC * pixel) const
@@ -189,11 +268,23 @@ std::uint8_t StandaloneFrontierMap::cellAt(int row, int col) const
   return cells_[static_cast<std::size_t>(index(row, col))];
 }
 
-void StandaloneFrontierMap::setCell(int row, int col, std::uint8_t value)
+int StandaloneFrontierMap::radiusMetersToPixels(double radius_m) const
 {
-  if (inBounds(row, col)) {
-    cells_[static_cast<std::size_t>(index(row, col))] = value;
+  return std::max(0, static_cast<int>(std::ceil(radius_m / config_.meters_per_pixel)));
+}
+
+void StandaloneFrontierMap::copyMaskTo(
+  const std::vector<std::uint8_t> & mask,
+  std::uint8_t * output,
+  std::size_t output_count) const
+{
+  if (output == nullptr) {
+    throw std::runtime_error("grid output pointer is null");
   }
+  if (output_count != mask.size()) {
+    throw std::runtime_error("grid output size does not match configured map size");
+  }
+  std::memcpy(output, mask.data(), mask.size() * sizeof(std::uint8_t));
 }
 
 void StandaloneFrontierMap::setMaskDisk(
@@ -203,40 +294,236 @@ void StandaloneFrontierMap::setMaskDisk(
   double radius_m,
   std::uint8_t value) const
 {
-  const int radius_px = std::max(0, static_cast<int>(std::ceil(radius_m / config_.meters_per_pixel)));
+  const int radius_px = radiusMetersToPixels(radius_m);
+  const int radius_sq = radius_px * radius_px;
   for (int dr = -radius_px; dr <= radius_px; ++dr) {
     for (int dc = -radius_px; dc <= radius_px; ++dc) {
-      if ((dr * dr + dc * dc) <= radius_px * radius_px) {
-        const int mask_row = row + dr;
-        const int mask_col = col + dc;
-        if (inBounds(mask_row, mask_col)) {
-          mask[static_cast<std::size_t>(index(mask_row, mask_col))] = value;
+      if ((dr * dr + dc * dc) > radius_sq) {
+        continue;
+      }
+      const int mask_row = row + dr;
+      const int mask_col = col + dc;
+      if (inBounds(mask_row, mask_col)) {
+        mask[static_cast<std::size_t>(index(mask_row, mask_col))] = value;
+      }
+    }
+  }
+}
+
+void StandaloneFrontierMap::addLogOdds(std::size_t cell_index, double delta)
+{
+  log_odds_[cell_index] = std::max(
+    config_.log_odds_min,
+    std::min(config_.log_odds_max, log_odds_[cell_index] + delta));
+}
+
+void StandaloneFrontierMap::addLogOddsDisk(int row, int col, double radius_m, double delta)
+{
+  const int radius_px = radiusMetersToPixels(radius_m);
+  const int radius_sq = radius_px * radius_px;
+  for (int dr = -radius_px; dr <= radius_px; ++dr) {
+    for (int dc = -radius_px; dc <= radius_px; ++dc) {
+      if ((dr * dr + dc * dc) > radius_sq) {
+        continue;
+      }
+      const int target_row = row + dr;
+      const int target_col = col + dc;
+      if (inBounds(target_row, target_col)) {
+        addLogOdds(static_cast<std::size_t>(index(target_row, target_col)), delta);
+      }
+    }
+  }
+}
+
+std::vector<StandaloneFrontierMap::RangeSample> StandaloneFrontierMap::filterRanges(
+  const double * ranges,
+  std::size_t range_count,
+  double range_min,
+  double range_max) const
+{
+  std::vector<RangeSample> samples(range_count);
+  for (std::size_t i = 0; i < range_count; ++i) {
+    const double range = ranges[i];
+    if (isFiniteHit(range, range_min, range_max)) {
+      samples[i] = RangeSample{range, true, true};
+    } else if (isNoHit(range, range_max)) {
+      samples[i] = RangeSample{range_max, true, false};
+    }
+  }
+
+  const int radius = config_.median_filter_radius;
+  if (radius > 0) {
+    std::vector<RangeSample> median_filtered = samples;
+    for (std::size_t i = 0; i < range_count; ++i) {
+      if (!samples[i].hit) {
+        continue;
+      }
+
+      std::vector<double> neighbors;
+      const int begin = std::max(0, static_cast<int>(i) - radius);
+      const int end = std::min(static_cast<int>(range_count) - 1, static_cast<int>(i) + radius);
+      for (int j = begin; j <= end; ++j) {
+        if (samples[static_cast<std::size_t>(j)].hit) {
+          neighbors.push_back(samples[static_cast<std::size_t>(j)].range);
+        }
+      }
+      if (neighbors.size() >= 2U) {
+        median_filtered[i].range = medianOf(neighbors);
+      }
+    }
+    samples.swap(median_filtered);
+  }
+
+  if (radius > 0 && config_.outlier_jump_m > 0.0 && range_count > 1U) {
+    std::vector<RangeSample> filtered = samples;
+    for (std::size_t i = 0; i < range_count; ++i) {
+      if (!samples[i].hit) {
+        continue;
+      }
+
+      bool has_support = false;
+      const int begin = std::max(0, static_cast<int>(i) - radius);
+      const int end = std::min(static_cast<int>(range_count) - 1, static_cast<int>(i) + radius);
+      for (int j = begin; j <= end; ++j) {
+        if (static_cast<std::size_t>(j) == i || !samples[static_cast<std::size_t>(j)].hit) {
+          continue;
+        }
+        if (std::abs(samples[static_cast<std::size_t>(j)].range - samples[i].range) <=
+          config_.outlier_jump_m)
+        {
+          has_support = true;
+          break;
+        }
+      }
+      if (!has_support) {
+        filtered[i] = RangeSample{};
+      }
+    }
+    samples.swap(filtered);
+  }
+
+  return samples;
+}
+
+void StandaloneFrontierMap::markRayFreeCells(
+  std::vector<std::uint8_t> & miss_mask,
+  const Odom & odom,
+  double angle_rad,
+  double clear_range_m) const
+{
+  if (clear_range_m <= 0.0) {
+    return;
+  }
+
+  const double step_m = std::max(0.01, config_.meters_per_pixel * 0.5);
+  int previous_index = -1;
+  const int step_count = static_cast<int>(std::ceil(clear_range_m / step_m));
+  for (int step = 0; step <= step_count; ++step) {
+    const double distance = std::min(clear_range_m, static_cast<double>(step) * step_m);
+    const auto [world_x, world_y] = lidarPointToWorld(distance, angle_rad, odom);
+    PixelRC pixel;
+    if (!worldToPixel(world_x, world_y, &pixel)) {
+      continue;
+    }
+
+    const int cell_index = index(pixel.row, pixel.col);
+    if (cell_index == previous_index) {
+      continue;
+    }
+    previous_index = cell_index;
+    miss_mask[static_cast<std::size_t>(cell_index)] = 1U;
+  }
+}
+
+std::vector<std::uint8_t> StandaloneFrontierMap::dilateMask(
+  const std::vector<std::uint8_t> & mask,
+  int radius_px) const
+{
+  if (radius_px <= 0) {
+    return mask;
+  }
+
+  std::vector<std::uint8_t> dilated(mask.size(), 0U);
+  const int radius_sq = radius_px * radius_px;
+  for (int row = 0; row < config_.height; ++row) {
+    for (int col = 0; col < config_.width; ++col) {
+      if (mask[static_cast<std::size_t>(index(row, col))] == 0U) {
+        continue;
+      }
+      for (int dr = -radius_px; dr <= radius_px; ++dr) {
+        for (int dc = -radius_px; dc <= radius_px; ++dc) {
+          if ((dr * dr + dc * dc) > radius_sq) {
+            continue;
+          }
+          const int target_row = row + dr;
+          const int target_col = col + dc;
+          if (inBounds(target_row, target_col)) {
+            dilated[static_cast<std::size_t>(index(target_row, target_col))] = 1U;
+          }
         }
       }
     }
   }
+  return dilated;
 }
 
-std::vector<std::uint8_t> StandaloneFrontierMap::dilatedObstacleMask() const
+std::vector<std::uint8_t> StandaloneFrontierMap::erodeMask(
+  const std::vector<std::uint8_t> & mask,
+  int radius_px) const
 {
-  std::vector<std::uint8_t> mask(obstacle_cells_.size(), 0U);
+  if (radius_px <= 0) {
+    return mask;
+  }
+
+  std::vector<std::uint8_t> eroded(mask.size(), 0U);
+  const int radius_sq = radius_px * radius_px;
   for (int row = 0; row < config_.height; ++row) {
     for (int col = 0; col < config_.width; ++col) {
-      if (obstacle_cells_[static_cast<std::size_t>(index(row, col))] != 0U) {
-        setMaskDisk(mask, row, col, config_.obstacle_radius_m, 1U);
+      bool keep = true;
+      for (int dr = -radius_px; keep && dr <= radius_px; ++dr) {
+        for (int dc = -radius_px; dc <= radius_px; ++dc) {
+          if ((dr * dr + dc * dc) > radius_sq) {
+            continue;
+          }
+          const int target_row = row + dr;
+          const int target_col = col + dc;
+          if (!inBounds(target_row, target_col) ||
+            mask[static_cast<std::size_t>(index(target_row, target_col))] == 0U)
+          {
+            keep = false;
+            break;
+          }
+        }
+      }
+      if (keep) {
+        eroded[static_cast<std::size_t>(index(row, col))] = 1U;
       }
     }
   }
-  return mask;
+  return eroded;
+}
+
+std::vector<std::uint8_t> StandaloneFrontierMap::closeMask(
+  const std::vector<std::uint8_t> & mask,
+  int radius_px) const
+{
+  return erodeMask(dilateMask(mask, radius_px), radius_px);
+}
+
+std::vector<std::uint8_t> StandaloneFrontierMap::openMask(
+  const std::vector<std::uint8_t> & mask,
+  int radius_px) const
+{
+  return dilateMask(erodeMask(mask, radius_px), radius_px);
 }
 
 std::vector<std::uint8_t> StandaloneFrontierMap::reachableMask(
   const PixelRC & start,
-  const std::vector<std::uint8_t> & obstacle_mask) const
+  const std::vector<std::uint8_t> & free_mask) const
 {
-  std::vector<std::uint8_t> reachable(obstacle_mask.size(), 0U);
+  std::vector<std::uint8_t> reachable(free_mask.size(), 0U);
   const auto start_index = static_cast<std::size_t>(index(start.row, start.col));
-  if (obstacle_mask[start_index] != 0U) {
+  if (free_mask[start_index] == 0U) {
     return reachable;
   }
 
@@ -256,7 +543,7 @@ std::vector<std::uint8_t> StandaloneFrontierMap::reachableMask(
       }
 
       const auto neighbor_index = static_cast<std::size_t>(index(neighbor_row, neighbor_col));
-      if (reachable[neighbor_index] != 0U || obstacle_mask[neighbor_index] != 0U) {
+      if (reachable[neighbor_index] != 0U || free_mask[neighbor_index] == 0U) {
         continue;
       }
       reachable[neighbor_index] = 1U;
@@ -267,47 +554,43 @@ std::vector<std::uint8_t> StandaloneFrontierMap::reachableMask(
   return reachable;
 }
 
-std::vector<std::uint8_t> StandaloneFrontierMap::erodeMask(
-  const std::vector<std::uint8_t> & mask,
-  int radius_px) const
+void StandaloneFrontierMap::rebuildGridFromLogOdds(const PixelRC & agent)
 {
-  if (radius_px <= 0) {
-    return mask;
-  }
+  std::vector<std::uint8_t> occupied(cells_.size(), 0U);
+  std::vector<std::uint8_t> free(cells_.size(), 0U);
 
-  std::vector<std::uint8_t> eroded(mask.size(), 0U);
-  const int radius_sq = radius_px * radius_px;
-  for (int row = 0; row < config_.height; ++row) {
-    for (int col = 0; col < config_.width; ++col) {
-      const auto cell_index = static_cast<std::size_t>(index(row, col));
-      if (mask[cell_index] == 0U) {
-        continue;
-      }
-
-      bool keep = true;
-      for (int dr = -radius_px; keep && dr <= radius_px; ++dr) {
-        for (int dc = -radius_px; dc <= radius_px; ++dc) {
-          if ((dr * dr + dc * dc) > radius_sq) {
-            continue;
-          }
-          const int neighbor_row = row + dr;
-          const int neighbor_col = col + dc;
-          if (!inBounds(neighbor_row, neighbor_col) ||
-            mask[static_cast<std::size_t>(index(neighbor_row, neighbor_col))] == 0U)
-          {
-            keep = false;
-            break;
-          }
-        }
-      }
-      if (!keep) {
-        continue;
-      }
-      eroded[cell_index] = 1U;
+  for (std::size_t i = 0; i < cells_.size(); ++i) {
+    if (log_odds_[i] >= config_.occupied_log_odds_threshold) {
+      occupied[i] = 1U;
+    } else if (log_odds_[i] <= config_.free_log_odds_threshold) {
+      free[i] = 1U;
     }
   }
 
-  return eroded;
+  occupied = openMask(occupied, radiusMetersToPixels(config_.morph_open_radius_m));
+  occupied = closeMask(occupied, radiusMetersToPixels(config_.morph_close_radius_m));
+  setMaskDisk(occupied, agent.row, agent.col, config_.robot_radius_m, 0U);
+  setMaskDisk(free, agent.row, agent.col, config_.robot_radius_m, 1U);
+  for (std::size_t i = 0; i < cells_.size(); ++i) {
+    if (occupied[i] != 0U) {
+      free[i] = 0U;
+    }
+  }
+
+  std::vector<std::uint8_t> reachable = reachableMask(agent, free);
+  reachable = erodeMask(reachable, radiusMetersToPixels(config_.reachable_erosion_radius_m));
+
+  std::fill(cells_.begin(), cells_.end(), kGridCellUnknown);
+  for (std::size_t i = 0; i < cells_.size(); ++i) {
+    if (occupied[i] != 0U) {
+      cells_[i] = kGridCellOccupied;
+    } else if (reachable[i] != 0U) {
+      cells_[i] = kGridCellFree;
+    }
+  }
+
+  occupied_mask_.swap(occupied);
+  reachable_free_mask_.swap(reachable);
 }
 
 std::pair<double, double> StandaloneFrontierMap::lidarPointToWorld(
@@ -349,6 +632,17 @@ FrontierResult StandaloneFrontierMap::detectFrontiers(const Odom & odom) const
   result.origin_y = config_.origin_y;
   result.agent_in_bounds = worldToPixel(odom.x, odom.y, &result.agent_pixel);
   result.agent_yaw = odomYawToMapYaw(odom.yaw);
+  result.raw_hit_count = countNonZero(raw_hit_mask_);
+  result.reachable_free_count = countNonZero(reachable_free_mask_);
+  for (std::uint8_t cell : cells_) {
+    if (cell == kGridCellFree) {
+      ++result.free_count;
+    } else if (cell == kGridCellOccupied) {
+      ++result.occupied_count;
+    } else {
+      ++result.unknown_count;
+    }
+  }
   if (!result.agent_in_bounds) {
     return result;
   }
@@ -493,6 +787,11 @@ std::string resultToJson(const FrontierResult & result)
   appendJsonBool(out, result.agent_in_bounds);
   out << ",";
   out << "\"agent_yaw\":" << result.agent_yaw << ",";
+  out << "\"unknown_count\":" << result.unknown_count << ",";
+  out << "\"free_count\":" << result.free_count << ",";
+  out << "\"occupied_count\":" << result.occupied_count << ",";
+  out << "\"raw_hit_count\":" << result.raw_hit_count << ",";
+  out << "\"reachable_free_count\":" << result.reachable_free_count << ",";
   out << "\"frontiers\":[";
   for (std::size_t i = 0; i < result.frontiers.size(); ++i) {
     const FrontierSegment & frontier = result.frontiers[i];

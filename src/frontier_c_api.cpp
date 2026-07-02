@@ -32,6 +32,19 @@ FrontierConfig toCppConfig(const OmniNavFrontierConfig & input)
   config.min_frontier_distance_m = input.min_frontier_distance_m;
   config.max_frontier_distance_m = input.max_frontier_distance_m;
   config.min_boundary_length_px = input.min_boundary_length_px;
+  config.log_odds_hit = input.log_odds_hit;
+  config.log_odds_miss = input.log_odds_miss;
+  config.log_odds_min = input.log_odds_min;
+  config.log_odds_max = input.log_odds_max;
+  config.occupied_log_odds_threshold = input.occupied_log_odds_threshold;
+  config.free_log_odds_threshold = input.free_log_odds_threshold;
+  config.endpoint_inflation_radius_m = input.endpoint_inflation_radius_m;
+  config.ray_endpoint_clearance_m = input.ray_endpoint_clearance_m;
+  config.median_filter_radius = input.median_filter_radius;
+  config.outlier_jump_m = input.outlier_jump_m;
+  config.morph_close_radius_m = input.morph_close_radius_m;
+  config.morph_open_radius_m = input.morph_open_radius_m;
+  config.reachable_erosion_radius_m = input.reachable_erosion_radius_m;
   return config;
 }
 
@@ -86,6 +99,19 @@ void omninav_frontier_default_config(OmniNavFrontierConfig * config)
   config->min_frontier_distance_m = defaults.min_frontier_distance_m;
   config->max_frontier_distance_m = defaults.max_frontier_distance_m;
   config->min_boundary_length_px = defaults.min_boundary_length_px;
+  config->log_odds_hit = defaults.log_odds_hit;
+  config->log_odds_miss = defaults.log_odds_miss;
+  config->log_odds_min = defaults.log_odds_min;
+  config->log_odds_max = defaults.log_odds_max;
+  config->occupied_log_odds_threshold = defaults.occupied_log_odds_threshold;
+  config->free_log_odds_threshold = defaults.free_log_odds_threshold;
+  config->endpoint_inflation_radius_m = defaults.endpoint_inflation_radius_m;
+  config->ray_endpoint_clearance_m = defaults.ray_endpoint_clearance_m;
+  config->median_filter_radius = defaults.median_filter_radius;
+  config->outlier_jump_m = defaults.outlier_jump_m;
+  config->morph_close_radius_m = defaults.morph_close_radius_m;
+  config->morph_open_radius_m = defaults.morph_open_radius_m;
+  config->reachable_erosion_radius_m = defaults.reachable_erosion_radius_m;
 }
 
 void * omninav_frontier_create(const OmniNavFrontierConfig * config)
@@ -150,6 +176,38 @@ int omninav_frontier_update(
       reset != 0);
     map->copyCellsTo(grid_output, grid_output_count);
     *result_json = duplicateString(omninav_frontier::resultToJson(result));
+    return 0;
+  } catch (const std::exception & error) {
+    writeError(error.what(), error_output, error_output_count);
+    return -1;
+  } catch (...) {
+    writeError("unknown C++ exception", error_output, error_output_count);
+    return -1;
+  }
+}
+
+int omninav_frontier_copy_debug_layers(
+  void * handle,
+  uint8_t * raw_hit_output,
+  uint8_t * occupied_output,
+  uint8_t * reachable_free_output,
+  size_t grid_output_count,
+  char * error_output,
+  size_t error_output_count)
+{
+  if (error_output != nullptr && error_output_count > 0U) {
+    error_output[0] = '\0';
+  }
+
+  try {
+    if (handle == nullptr) {
+      throw std::runtime_error("frontier map handle is null");
+    }
+
+    auto * map = static_cast<StandaloneFrontierMap *>(handle);
+    map->copyRawHitMaskTo(raw_hit_output, grid_output_count);
+    map->copyOccupiedMaskTo(occupied_output, grid_output_count);
+    map->copyReachableFreeMaskTo(reachable_free_output, grid_output_count);
     return 0;
   } catch (const std::exception & error) {
     writeError(error.what(), error_output, error_output_count);

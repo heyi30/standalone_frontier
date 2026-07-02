@@ -20,6 +20,19 @@ typedef struct OmniNavFrontierConfig
   double min_frontier_distance_m;
   double max_frontier_distance_m;
   size_t min_boundary_length_px;
+  double log_odds_hit;
+  double log_odds_miss;
+  double log_odds_min;
+  double log_odds_max;
+  double occupied_log_odds_threshold;
+  double free_log_odds_threshold;
+  double endpoint_inflation_radius_m;
+  double ray_endpoint_clearance_m;
+  int median_filter_radius;
+  double outlier_jump_m;
+  double morph_close_radius_m;
+  double morph_open_radius_m;
+  double reachable_erosion_radius_m;
 } OmniNavFrontierConfig;
 
 typedef struct OmniNavFrontierOdom
@@ -49,6 +62,15 @@ int omninav_frontier_update(
   uint8_t * grid_output,
   size_t grid_output_count,
   char ** result_json,
+  char * error_output,
+  size_t error_output_count);
+
+int omninav_frontier_copy_debug_layers(
+  void * handle,
+  uint8_t * raw_hit_output,
+  uint8_t * occupied_output,
+  uint8_t * reachable_free_output,
+  size_t grid_output_count,
   char * error_output,
   size_t error_output_count);
 
