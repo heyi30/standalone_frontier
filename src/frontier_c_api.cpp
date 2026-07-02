@@ -205,9 +205,11 @@ int omninav_frontier_copy_debug_layers(
     }
 
     auto * map = static_cast<StandaloneFrontierMap *>(handle);
-    map->copyRawHitMaskTo(raw_hit_output, grid_output_count);
-    map->copyOccupiedMaskTo(occupied_output, grid_output_count);
-    map->copyReachableFreeMaskTo(reachable_free_output, grid_output_count);
+    map->copyDebugLayersTo(
+      raw_hit_output,
+      occupied_output,
+      reachable_free_output,
+      grid_output_count);
     return 0;
   } catch (const std::exception & error) {
     writeError(error.what(), error_output, error_output_count);

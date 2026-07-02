@@ -112,12 +112,12 @@ public:
     const Odom & odom,
     bool reset_first);
 
-  const FrontierConfig & config() const;
-  const std::vector<std::uint8_t> & cells() const;
   void copyCellsTo(std::uint8_t * output, std::size_t output_count) const;
-  void copyRawHitMaskTo(std::uint8_t * output, std::size_t output_count) const;
-  void copyOccupiedMaskTo(std::uint8_t * output, std::size_t output_count) const;
-  void copyReachableFreeMaskTo(std::uint8_t * output, std::size_t output_count) const;
+  void copyDebugLayersTo(
+    std::uint8_t * raw_hit_output,
+    std::uint8_t * occupied_output,
+    std::uint8_t * reachable_free_output,
+    std::size_t output_count) const;
 
 private:
   struct RangeSample
@@ -130,7 +130,6 @@ private:
   bool worldToPixel(double world_x, double world_y, PixelRC * pixel) const;
   bool inBounds(int row, int col) const;
   int index(int row, int col) const;
-  std::uint8_t cellAt(int row, int col) const;
   int radiusMetersToPixels(double radius_m) const;
   void copyMaskTo(
     const std::vector<std::uint8_t> & mask,

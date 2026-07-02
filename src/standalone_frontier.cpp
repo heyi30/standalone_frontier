@@ -4,7 +4,6 @@
 #include <array>
 #include <cmath>
 #include <cstring>
-#include <limits>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -82,9 +81,47 @@ std::size_t countNonZero(const std::vector<std::uint8_t> & values)
   return static_cast<std::size_t>(std::count(values.begin(), values.end(), 1U));
 }
 
-void appendJsonBool(std::ostringstream & out, bool value)
+template<typename Func>
+void forDiskPixels(int row, int col, int radius_px, int width, int height, Func func)
 {
-  out << (value ? "true" : "false");
+  const int radius_sq = radius_px * radius_px;
+  for (int dr = -radius_px; dr <= radius_px; ++dr) {
+    for (int dc = -radius_px; dc <= radius_px; ++dc) {
+      const int next_row = row + dr;
+      const int next_col = col + dc;
+      if ((dr * dr + dc * dc) <= radius_sq &&
+        next_row >= 0 && next_row < height && next_col >= 0 && next_col < width)
+      {
+        func(next_row, next_col, static_cast<std::size_t>(next_row * width + next_col));
+      }
+    }
+  }
+}
+
+bool diskAllSet(
+  const std::vector<std::uint8_t> & mask,
+  int row,
+  int col,
+  int radius_px,
+  int width,
+  int height)
+{
+  const int radius_sq = radius_px * radius_px;
+  for (int dr = -radius_px; dr <= radius_px; ++dr) {
+    for (int dc = -radius_px; dc <= radius_px; ++dc) {
+      if ((dr * dr + dc * dc) > radius_sq) {
+        continue;
+      }
+      const int next_row = row + dr;
+      const int next_col = col + dc;
+      if (next_row < 0 || next_row >= height || next_col < 0 || next_col >= width ||
+        mask[static_cast<std::size_t>(next_row * width + next_col)] == 0U)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -92,10 +129,10 @@ void appendJsonBool(std::ostringstream & out, bool value)
 StandaloneFrontierMap::StandaloneFrontierMap(FrontierConfig config)
 : config_(config),
   cells_(checkedCellCount(config), kGridCellUnknown),
-  log_odds_(checkedCellCount(config), 0.0),
-  raw_hit_mask_(checkedCellCount(config), 0U),
-  occupied_mask_(checkedCellCount(config), 0U),
-  reachable_free_mask_(checkedCellCount(config), 0U)
+  log_odds_(cells_.size(), 0.0),
+  raw_hit_mask_(cells_.size(), 0U),
+  occupied_mask_(cells_.size(), 0U),
+  reachable_free_mask_(cells_.size(), 0U)
 {
   if (config_.meters_per_pixel <= 0.0) {
     throw std::runtime_error("meters_per_pixel must be positive");
@@ -204,36 +241,20 @@ FrontierResult StandaloneFrontierMap::update(
   return detectFrontiers(odom);
 }
 
-const FrontierConfig & StandaloneFrontierMap::config() const
-{
-  return config_;
-}
-
-const std::vector<std::uint8_t> & StandaloneFrontierMap::cells() const
-{
-  return cells_;
-}
-
 void StandaloneFrontierMap::copyCellsTo(std::uint8_t * output, std::size_t output_count) const
 {
   copyMaskTo(cells_, output, output_count);
 }
 
-void StandaloneFrontierMap::copyRawHitMaskTo(std::uint8_t * output, std::size_t output_count) const
-{
-  copyMaskTo(raw_hit_mask_, output, output_count);
-}
-
-void StandaloneFrontierMap::copyOccupiedMaskTo(std::uint8_t * output, std::size_t output_count) const
-{
-  copyMaskTo(occupied_mask_, output, output_count);
-}
-
-void StandaloneFrontierMap::copyReachableFreeMaskTo(
-  std::uint8_t * output,
+void StandaloneFrontierMap::copyDebugLayersTo(
+  std::uint8_t * raw_hit_output,
+  std::uint8_t * occupied_output,
+  std::uint8_t * reachable_free_output,
   std::size_t output_count) const
 {
-  copyMaskTo(reachable_free_mask_, output, output_count);
+  copyMaskTo(raw_hit_mask_, raw_hit_output, output_count);
+  copyMaskTo(occupied_mask_, occupied_output, output_count);
+  copyMaskTo(reachable_free_mask_, reachable_free_output, output_count);
 }
 
 bool StandaloneFrontierMap::worldToPixel(double world_x, double world_y, PixelRC * pixel) const
@@ -263,11 +284,6 @@ int StandaloneFrontierMap::index(int row, int col) const
   return row * config_.width + col;
 }
 
-std::uint8_t StandaloneFrontierMap::cellAt(int row, int col) const
-{
-  return cells_[static_cast<std::size_t>(index(row, col))];
-}
-
 int StandaloneFrontierMap::radiusMetersToPixels(double radius_m) const
 {
   return std::max(0, static_cast<int>(std::ceil(radius_m / config_.meters_per_pixel)));
@@ -294,45 +310,20 @@ void StandaloneFrontierMap::setMaskDisk(
   double radius_m,
   std::uint8_t value) const
 {
-  const int radius_px = radiusMetersToPixels(radius_m);
-  const int radius_sq = radius_px * radius_px;
-  for (int dr = -radius_px; dr <= radius_px; ++dr) {
-    for (int dc = -radius_px; dc <= radius_px; ++dc) {
-      if ((dr * dr + dc * dc) > radius_sq) {
-        continue;
-      }
-      const int mask_row = row + dr;
-      const int mask_col = col + dc;
-      if (inBounds(mask_row, mask_col)) {
-        mask[static_cast<std::size_t>(index(mask_row, mask_col))] = value;
-      }
-    }
-  }
+  forDiskPixels(row, col, radiusMetersToPixels(radius_m), config_.width, config_.height,
+    [&](int, int, std::size_t idx) { mask[idx] = value; });
 }
 
 void StandaloneFrontierMap::addLogOdds(std::size_t cell_index, double delta)
 {
-  log_odds_[cell_index] = std::max(
-    config_.log_odds_min,
-    std::min(config_.log_odds_max, log_odds_[cell_index] + delta));
+  log_odds_[cell_index] =
+    std::clamp(log_odds_[cell_index] + delta, config_.log_odds_min, config_.log_odds_max);
 }
 
 void StandaloneFrontierMap::addLogOddsDisk(int row, int col, double radius_m, double delta)
 {
-  const int radius_px = radiusMetersToPixels(radius_m);
-  const int radius_sq = radius_px * radius_px;
-  for (int dr = -radius_px; dr <= radius_px; ++dr) {
-    for (int dc = -radius_px; dc <= radius_px; ++dc) {
-      if ((dr * dr + dc * dc) > radius_sq) {
-        continue;
-      }
-      const int target_row = row + dr;
-      const int target_col = col + dc;
-      if (inBounds(target_row, target_col)) {
-        addLogOdds(static_cast<std::size_t>(index(target_row, target_col)), delta);
-      }
-    }
-  }
+  forDiskPixels(row, col, radiusMetersToPixels(radius_m), config_.width, config_.height,
+    [&](int, int, std::size_t idx) { addLogOdds(idx, delta); });
 }
 
 std::vector<StandaloneFrontierMap::RangeSample> StandaloneFrontierMap::filterRanges(
@@ -352,6 +343,18 @@ std::vector<StandaloneFrontierMap::RangeSample> StandaloneFrontierMap::filterRan
   }
 
   const int radius = config_.median_filter_radius;
+  const auto hit_window = [&](std::size_t i) {
+      std::vector<std::size_t> indices;
+      const int begin = std::max(0, static_cast<int>(i) - radius);
+      const int end = std::min(static_cast<int>(range_count) - 1, static_cast<int>(i) + radius);
+      for (int j = begin; j <= end; ++j) {
+        if (samples[static_cast<std::size_t>(j)].hit) {
+          indices.push_back(static_cast<std::size_t>(j));
+        }
+      }
+      return indices;
+    };
+
   if (radius > 0) {
     std::vector<RangeSample> median_filtered = samples;
     for (std::size_t i = 0; i < range_count; ++i) {
@@ -359,16 +362,13 @@ std::vector<StandaloneFrontierMap::RangeSample> StandaloneFrontierMap::filterRan
         continue;
       }
 
-      std::vector<double> neighbors;
-      const int begin = std::max(0, static_cast<int>(i) - radius);
-      const int end = std::min(static_cast<int>(range_count) - 1, static_cast<int>(i) + radius);
-      for (int j = begin; j <= end; ++j) {
-        if (samples[static_cast<std::size_t>(j)].hit) {
-          neighbors.push_back(samples[static_cast<std::size_t>(j)].range);
-        }
-      }
+      const std::vector<std::size_t> neighbors = hit_window(i);
       if (neighbors.size() >= 2U) {
-        median_filtered[i].range = medianOf(neighbors);
+        std::vector<double> values;
+        for (std::size_t neighbor : neighbors) {
+          values.push_back(samples[neighbor].range);
+        }
+        median_filtered[i].range = medianOf(values);
       }
     }
     samples.swap(median_filtered);
@@ -381,21 +381,12 @@ std::vector<StandaloneFrontierMap::RangeSample> StandaloneFrontierMap::filterRan
         continue;
       }
 
-      bool has_support = false;
-      const int begin = std::max(0, static_cast<int>(i) - radius);
-      const int end = std::min(static_cast<int>(range_count) - 1, static_cast<int>(i) + radius);
-      for (int j = begin; j <= end; ++j) {
-        if (static_cast<std::size_t>(j) == i || !samples[static_cast<std::size_t>(j)].hit) {
-          continue;
-        }
-        if (std::abs(samples[static_cast<std::size_t>(j)].range - samples[i].range) <=
-          config_.outlier_jump_m)
-        {
-          has_support = true;
-          break;
-        }
-      }
-      if (!has_support) {
+      const std::vector<std::size_t> neighbors = hit_window(i);
+      const bool supported = std::any_of(neighbors.begin(), neighbors.end(), [&](std::size_t neighbor) {
+          return neighbor != i &&
+            std::abs(samples[neighbor].range - samples[i].range) <= config_.outlier_jump_m;
+        });
+      if (!supported) {
         filtered[i] = RangeSample{};
       }
     }
@@ -444,24 +435,13 @@ std::vector<std::uint8_t> StandaloneFrontierMap::dilateMask(
   }
 
   std::vector<std::uint8_t> dilated(mask.size(), 0U);
-  const int radius_sq = radius_px * radius_px;
   for (int row = 0; row < config_.height; ++row) {
     for (int col = 0; col < config_.width; ++col) {
       if (mask[static_cast<std::size_t>(index(row, col))] == 0U) {
         continue;
       }
-      for (int dr = -radius_px; dr <= radius_px; ++dr) {
-        for (int dc = -radius_px; dc <= radius_px; ++dc) {
-          if ((dr * dr + dc * dc) > radius_sq) {
-            continue;
-          }
-          const int target_row = row + dr;
-          const int target_col = col + dc;
-          if (inBounds(target_row, target_col)) {
-            dilated[static_cast<std::size_t>(index(target_row, target_col))] = 1U;
-          }
-        }
-      }
+      forDiskPixels(row, col, radius_px, config_.width, config_.height,
+        [&](int, int, std::size_t idx) { dilated[idx] = 1U; });
     }
   }
   return dilated;
@@ -476,26 +456,9 @@ std::vector<std::uint8_t> StandaloneFrontierMap::erodeMask(
   }
 
   std::vector<std::uint8_t> eroded(mask.size(), 0U);
-  const int radius_sq = radius_px * radius_px;
   for (int row = 0; row < config_.height; ++row) {
     for (int col = 0; col < config_.width; ++col) {
-      bool keep = true;
-      for (int dr = -radius_px; keep && dr <= radius_px; ++dr) {
-        for (int dc = -radius_px; dc <= radius_px; ++dc) {
-          if ((dr * dr + dc * dc) > radius_sq) {
-            continue;
-          }
-          const int target_row = row + dr;
-          const int target_col = col + dc;
-          if (!inBounds(target_row, target_col) ||
-            mask[static_cast<std::size_t>(index(target_row, target_col))] == 0U)
-          {
-            keep = false;
-            break;
-          }
-        }
-      }
-      if (keep) {
+      if (diskAllSet(mask, row, col, radius_px, config_.width, config_.height)) {
         eroded[static_cast<std::size_t>(index(row, col))] = 1U;
       }
     }
@@ -614,7 +577,7 @@ bool StandaloneFrontierMap::hasUnknownNeighbor(int row, int col) const
     const int neighbor_row = row + direction.row;
     const int neighbor_col = col + direction.col;
     if (inBounds(neighbor_row, neighbor_col) &&
-      cellAt(neighbor_row, neighbor_col) == kGridCellUnknown)
+      cells_[static_cast<std::size_t>(index(neighbor_row, neighbor_col))] == kGridCellUnknown)
     {
       return true;
     }
@@ -634,18 +597,6 @@ FrontierResult StandaloneFrontierMap::detectFrontiers(const Odom & odom) const
   result.agent_yaw = odomYawToMapYaw(odom.yaw);
   result.raw_hit_count = countNonZero(raw_hit_mask_);
   result.reachable_free_count = countNonZero(reachable_free_mask_);
-  for (std::uint8_t cell : cells_) {
-    if (cell == kGridCellFree) {
-      ++result.free_count;
-    } else if (cell == kGridCellOccupied) {
-      ++result.occupied_count;
-    } else {
-      ++result.unknown_count;
-    }
-  }
-  if (!result.agent_in_bounds) {
-    return result;
-  }
 
   const auto cell_count = static_cast<std::size_t>(config_.width * config_.height);
   std::vector<std::uint8_t> frontier_mask(cell_count, 0U);
@@ -654,10 +605,17 @@ FrontierResult StandaloneFrontierMap::detectFrontiers(const Odom & odom) const
   for (int row = 0; row < config_.height; ++row) {
     for (int col = 0; col < config_.width; ++col) {
       const auto idx = static_cast<std::size_t>(index(row, col));
-      if (cells_[idx] == kGridCellFree && hasUnknownNeighbor(row, col)) {
+      const std::uint8_t cell = cells_[idx];
+      result.free_count += cell == kGridCellFree ? 1U : 0U;
+      result.occupied_count += cell == kGridCellOccupied ? 1U : 0U;
+      result.unknown_count += cell == kGridCellUnknown ? 1U : 0U;
+      if (result.agent_in_bounds && cell == kGridCellFree && hasUnknownNeighbor(row, col)) {
         frontier_mask[idx] = 1U;
       }
     }
+  }
+  if (!result.agent_in_bounds) {
+    return result;
   }
 
   int next_id = 0;
@@ -685,29 +643,15 @@ FrontierResult StandaloneFrontierMap::detectFrontiers(const Odom & odom) const
           const int neighbor_row = current.row + direction.row;
           const int neighbor_col = current.col + direction.col;
           if (!inBounds(neighbor_row, neighbor_col) ||
-            cellAt(neighbor_row, neighbor_col) != kGridCellUnknown)
+            cells_[static_cast<std::size_t>(index(neighbor_row, neighbor_col))] != kGridCellUnknown)
           {
             continue;
           }
 
-          FrontierPointRC start;
-          FrontierPointRC end;
-          if (direction.row < 0) {
-            start = {static_cast<double>(current.row), static_cast<double>(current.col)};
-            end = {static_cast<double>(current.row), static_cast<double>(current.col + 1)};
-          } else if (direction.row > 0) {
-            start = {static_cast<double>(current.row + 1), static_cast<double>(current.col)};
-            end = {static_cast<double>(current.row + 1), static_cast<double>(current.col + 1)};
-          } else if (direction.col < 0) {
-            start = {static_cast<double>(current.row), static_cast<double>(current.col)};
-            end = {static_cast<double>(current.row + 1), static_cast<double>(current.col)};
-          } else {
-            start = {static_cast<double>(current.row), static_cast<double>(current.col + 1)};
-            end = {static_cast<double>(current.row + 1), static_cast<double>(current.col + 1)};
-          }
-
-          midpoint_row_sum += (start.row + end.row) * 0.5;
-          midpoint_col_sum += (start.col + end.col) * 0.5;
+          midpoint_row_sum += static_cast<double>(current.row) + 0.5 +
+            0.5 * static_cast<double>(direction.row);
+          midpoint_col_sum += static_cast<double>(current.col) + 0.5 +
+            0.5 * static_cast<double>(direction.col);
           ++segment.boundary_edge_count;
         }
 
@@ -783,9 +727,7 @@ std::string resultToJson(const FrontierResult & result)
   out << "\"origin_x\":" << result.origin_x << ",";
   out << "\"origin_y\":" << result.origin_y << ",";
   out << "\"agent_pixel\":[" << result.agent_pixel.row << "," << result.agent_pixel.col << "],";
-  out << "\"agent_in_bounds\":";
-  appendJsonBool(out, result.agent_in_bounds);
-  out << ",";
+  out << "\"agent_in_bounds\":" << std::boolalpha << result.agent_in_bounds << ",";
   out << "\"agent_yaw\":" << result.agent_yaw << ",";
   out << "\"unknown_count\":" << result.unknown_count << ",";
   out << "\"free_count\":" << result.free_count << ",";
