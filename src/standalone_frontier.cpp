@@ -713,6 +713,52 @@ FrontierResult StandaloneFrontierMap::detectFrontiers(const Odom & odom) const
     }
   }
 
+  if (result.frontiers.empty()) {
+    const double yaw_c = std::cos(result.agent_yaw);
+    const double yaw_s = std::sin(result.agent_yaw);
+    const int max_steps = std::max(config_.width, config_.height) * 3;
+    const auto add_edge_frontier = [&](double local_right, double local_forward) {
+        double row = static_cast<double>(result.agent_pixel.row) + 0.5;
+        double col = static_cast<double>(result.agent_pixel.col) + 0.5;
+        const double dcol = yaw_c * local_right + yaw_s * local_forward;
+        const double drow = yaw_s * local_right - yaw_c * local_forward;
+        PixelRC last_free{-1, -1};
+
+        for (int step = 0; step < max_steps; ++step) {
+          const int current_row = static_cast<int>(std::floor(row));
+          const int current_col = static_cast<int>(std::floor(col));
+          if (!inBounds(current_row, current_col) ||
+            cells_[static_cast<std::size_t>(index(current_row, current_col))] != kGridCellFree)
+          {
+            break;
+          }
+          last_free = PixelRC{current_row, current_col};
+          row += drow * 0.5;
+          col += dcol * 0.5;
+        }
+        if (last_free.row < 0) {
+          return;
+        }
+
+        FrontierSegment segment;
+        segment.id = next_id++;
+        segment.cell_count = 1;
+        segment.boundary_edge_count = 1U;
+        segment.midpoint = {
+          static_cast<double>(last_free.row) + 0.5,
+          static_cast<double>(last_free.col) + 0.5};
+        const auto [right_m, forward_m] = frontierPointToLocalXz(result, segment.midpoint);
+        segment.local_right_m = right_m;
+        segment.local_forward_m = forward_m;
+        result.frontiers.push_back(segment);
+      };
+
+    add_edge_frontier(0.0, 1.0);
+    add_edge_frontier(0.0, -1.0);
+    add_edge_frontier(-1.0, 0.0);
+    add_edge_frontier(1.0, 0.0);
+  }
+
   return result;
 }
 
