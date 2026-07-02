@@ -168,6 +168,7 @@ private:
   std::vector<std::uint8_t> reachableMask(
     const PixelRC & start,
     const std::vector<std::uint8_t> & free_mask) const;
+  int heightLayerForZ(double z_m) const;
   void rebuildGridFromLogOdds(const PixelRC & agent);
   std::pair<double, double> lidarPointToWorld(
     double range_m,
@@ -185,6 +186,8 @@ private:
   std::vector<std::uint8_t> raw_hit_mask_;
   std::vector<std::uint8_t> occupied_mask_;
   std::vector<std::uint8_t> reachable_free_mask_;
+  bool has_height_layer_{false};
+  int current_height_layer_{0};
 };
 
 std::string resultToJson(const FrontierResult & result);

@@ -16,6 +16,8 @@ namespace
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kMinFrontierSeparationM = 1.0;
+constexpr double kHeightLayerM = 0.5;
+constexpr double kHeightLayerDeadzoneM = 0.2;
 constexpr std::array<StandaloneFrontierMap::Direction, 4> kCardinalDirections{{
   {-1, 0},
   {1, 0},
@@ -171,6 +173,8 @@ void StandaloneFrontierMap::reset()
   std::fill(raw_hit_mask_.begin(), raw_hit_mask_.end(), 0U);
   std::fill(occupied_mask_.begin(), occupied_mask_.end(), 0U);
   std::fill(reachable_free_mask_.begin(), reachable_free_mask_.end(), 0U);
+  has_height_layer_ = false;
+  current_height_layer_ = 0;
 }
 
 FrontierResult StandaloneFrontierMap::update(
@@ -192,6 +196,13 @@ FrontierResult StandaloneFrontierMap::update(
   if (range_max < range_min) {
     throw std::runtime_error("range_max must be >= range_min");
   }
+
+  const int height_layer = heightLayerForZ(odom.z);
+  if (has_height_layer_ && height_layer != current_height_layer_) {
+    reset();
+  }
+  current_height_layer_ = height_layer;
+  has_height_layer_ = true;
 
   std::fill(raw_hit_mask_.begin(), raw_hit_mask_.end(), 0U);
   PixelRC agent;
@@ -516,6 +527,25 @@ std::vector<std::uint8_t> StandaloneFrontierMap::reachableMask(
   }
 
   return reachable;
+}
+
+int StandaloneFrontierMap::heightLayerForZ(double z_m) const
+{
+  if (!has_height_layer_) {
+    return static_cast<int>(std::floor(z_m / kHeightLayerM));
+  }
+
+  const double upper_switch_m =
+    static_cast<double>(current_height_layer_ + 1) * kHeightLayerM + kHeightLayerDeadzoneM;
+  const double lower_switch_m =
+    static_cast<double>(current_height_layer_) * kHeightLayerM - kHeightLayerDeadzoneM;
+  if (z_m >= upper_switch_m) {
+    return static_cast<int>(std::floor((z_m - kHeightLayerDeadzoneM) / kHeightLayerM));
+  }
+  if (z_m < lower_switch_m) {
+    return static_cast<int>(std::floor((z_m + kHeightLayerDeadzoneM) / kHeightLayerM));
+  }
+  return current_height_layer_;
 }
 
 void StandaloneFrontierMap::rebuildGridFromLogOdds(const PixelRC & agent)
