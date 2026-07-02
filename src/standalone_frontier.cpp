@@ -15,6 +15,7 @@ namespace
 {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kMinFrontierSeparationM = 1.0;
 constexpr std::array<StandaloneFrontierMap::Direction, 4> kCardinalDirections{{
   {-1, 0},
   {1, 0},
@@ -687,6 +688,20 @@ FrontierResult StandaloneFrontierMap::detectFrontiers(const Odom & odom) const
       if (distance_sq_m < config_.min_frontier_distance_m * config_.min_frontier_distance_m ||
         distance_sq_m > config_.max_frontier_distance_m * config_.max_frontier_distance_m)
       {
+        continue;
+      }
+      const bool near_existing = std::any_of(
+        result.frontiers.begin(),
+        result.frontiers.end(),
+        [&](const FrontierSegment & existing) {
+          const double row_delta_m =
+            (segment.midpoint.row - existing.midpoint.row) * config_.meters_per_pixel;
+          const double col_delta_m =
+            (segment.midpoint.col - existing.midpoint.col) * config_.meters_per_pixel;
+          return row_delta_m * row_delta_m + col_delta_m * col_delta_m <
+            kMinFrontierSeparationM * kMinFrontierSeparationM;
+        });
+      if (near_existing) {
         continue;
       }
 
